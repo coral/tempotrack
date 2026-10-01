@@ -1,0 +1,13 @@
+{
+  "sample_rate": 44100,
+  "tracks": [
+    {
+      "id": "example",
+      "file": "your-track.flac",
+      "reference": "tempo_only",
+      "segments": [
+        { "start": 15, "end": 120, "bpm": 120 }
+      ]
+    }
+  ]
+}
