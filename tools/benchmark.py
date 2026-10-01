@@ -19,6 +19,22 @@ def quantile(values, fraction):
     return sorted(values)[min(len(values) - 1, int(fraction * len(values)))] if values else None
 
 
+def session_segments(segments, start):
+    """Translate source annotations to a fresh tracker session without changing phase."""
+    shifted = []
+    for segment in segments:
+        if segment.get('end', math.inf) <= start:
+            continue
+        segment = dict(segment)
+        segment['start'] = max(0, segment.get('start', 0) - start)
+        if 'end' in segment:
+            segment['end'] -= start
+        if 'beat_offset' in segment:
+            segment['beat_offset'] -= start
+        shifted.append(segment)
+    return shifted
+
+
 def metrics(rows, segments, duration):
     times = [r['time'] for r in rows]
     errors, bpms, phases, changes, clock_errors = [], [], [], [], []
@@ -103,13 +119,16 @@ def main():
     parser.add_argument('manifest', type=Path)
     parser.add_argument('--out', type=Path, default=ROOT / 'target' / 'benchmark')
     parser.add_argument('--backend', choices=['both', 'beatnet', 'pulseweave'], default='both')
-    parser.add_argument('--limit', type=float, help='Decode only this many seconds, from the beginning')
+    parser.add_argument('--start', type=float, default=0, help='Start a fresh tracker session this many seconds into each source')
+    parser.add_argument('--limit', type=float, help='Decode only this many seconds after --start')
     parser.add_argument('--track', action='append', help='Manifest ID to include (repeatable)')
     parser.add_argument('--model', type=int, choices=[1, 2, 3], default=1)
     parser.add_argument('--cached', action='store_true', help='Re-score existing raw traces without decoding/inference')
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text())
     rate = manifest.get('sample_rate', 44100)
+    if not math.isfinite(args.start) or args.start < 0:
+        parser.error('--start must be nonnegative and finite')
     if args.limit is not None and (not math.isfinite(args.limit) or args.limit <= 0):
         parser.error('--limit must be positive and finite')
     if not isinstance(rate, int) or not 8000 <= rate <= 192000:
@@ -118,6 +137,7 @@ def main():
         parser.error('--track contains IDs not present in the manifest')
     args.out.mkdir(parents=True, exist_ok=True)
     run_info = {'complete': False, 'sample_rate': rate, 'model': args.model,
+                'source_start_seconds': args.start,
                 'manifest_sha256': hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
                 'source_sha256': {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                                   for name in ['Cargo.lock', 'src/backend.rs', 'src/clock.rs', 'src/config.rs']}}
@@ -143,13 +163,19 @@ def main():
             if segment.get('start', 0) < last_end:
                 parser.error('ground-truth segments must be ordered and nonoverlapping')
             last_end = segment.get('end', math.inf)
+        segments = session_segments(segments, args.start)
         backends = ['pulseweave', 'beatnet'] if args.backend == 'both' else [args.backend]
         with tempfile.TemporaryDirectory(prefix='tempotrack-', dir=args.out) as temporary:
             pcm = Path(temporary) / 'audio.f32'
             meta = args.out / f'{identity}.meta.json'
             if not args.cached:
                 source = (args.manifest.resolve().parent / track['file']).resolve()
-                command = ['ffmpeg', '-nostdin', '-v', 'error', '-i', str(source)]
+                command = ['ffmpeg', '-nostdin', '-v', 'error']
+                if args.start:
+                    # Input seeking is sample-accurate when transcoding. No prefix
+                    # audio reaches the tracker, so this is a true cold start.
+                    command += ['-ss', str(args.start)]
+                command += ['-i', str(source)]
                 if args.limit:
                     command += ['-t', str(args.limit)]
                 # Explicit equal-weight mixing matches the live capture path.
@@ -159,11 +185,14 @@ def main():
                 command += ['-map', '0:a:0', '-af', f'pan=mono|c0={mix}', '-ar', str(rate), '-f', 'f32le', str(pcm)]
                 subprocess.run(command, check=True)
                 duration = pcm.stat().st_size / 4 / rate
+                if duration <= 0:
+                    parser.error(f'no audio after --start for {identity}')
                 digest = hashlib.sha256()
                 with source.open('rb') as file:
                     while block := file.read(1024 * 1024):
                         digest.update(block)
-                metadata = {'duration': duration, 'sample_rate': rate, 'source_sha256': digest.hexdigest(), 'trace_version': 1, 'model': args.model}
+                metadata = {'duration': duration, 'sample_rate': rate, 'source_sha256': digest.hexdigest(), 'trace_version': 1, 'model': args.model,
+                            'source_start_seconds': args.start}
                 meta.write_text(json.dumps(metadata))
             else:
                 metadata = json.loads(meta.read_text())
@@ -173,6 +202,8 @@ def main():
                     parser.error('cached sample rate differs from manifest')
                 if metadata.get('model', 1) != args.model:
                     parser.error('cached model differs; regenerate observations')
+                if metadata.get('source_start_seconds', 0) != args.start:
+                    parser.error('cached source start differs; use the same --start or regenerate observations')
                 duration = metadata['duration']
             series = []
             for backend in backends:
@@ -202,7 +233,8 @@ def main():
                         with measured.open('w') as output:
                             subprocess.run(command, stdout=output, check=True)
                     rows = load_rows(measured)
-                    result = {'id': identity, 'reference': track.get('reference', 'tempo_only'), 'backend': backend, 'mode': mode, 'model': args.model, **metrics(rows, segments, duration)}
+                    result = {'id': identity, 'reference': track.get('reference', 'tempo_only'), 'backend': backend, 'mode': mode, 'model': args.model,
+                              'source_start_seconds': args.start, **metrics(rows, segments, duration)}
                     series.append((f'{backend} {mode}', rows))
                     report.append(result)
                     print(json.dumps(result), flush=True)
@@ -213,7 +245,8 @@ def main():
         writer = csv.DictWriter(file, fieldnames=list(report[0]) if report else ['id'])
         writer.writeheader()
         writer.writerows(report)
-    (args.out / 'report.html').write_text('<!doctype html><meta charset="utf-8"><title>Tempo benchmark</title><style>body{background:#191b20;color:#ddd;font:14px system-ui;max-width:1150px;margin:40px auto}svg{width:100%;background:#22262d}text{fill:#bbc0c9}h2{margin-top:36px}</style><h1>Offline tempo benchmark</h1><p>Dashed white: supplied reference (possibly approximate/tapped). Distance from this line is not proof of tracking error. Traces: causal estimates sampled every 250 ms. Names and audio are not embedded. Phase accuracy requires annotated beat timestamps.</p>' + ''.join(plots))
+    (args.out / 'report.html').write_text('<!doctype html><meta charset="utf-8"><title>Tempo benchmark</title><style>body{background:#191b20;color:#ddd;font:14px system-ui;max-width:1150px;margin:40px auto}svg{width:100%;background:#22262d}text{fill:#bbc0c9}h2{margin-top:36px}</style><h1>Offline tempo benchmark</h1><p>Dashed white: supplied reference (possibly approximate/tapped). Distance from this line is not proof of tracking error. Traces: causal estimates sampled every 250 ms. Names and audio are not embedded. Phase accuracy requires annotated beat timestamps.</p>'
+        + f'<p>Times are relative to a fresh tracker session, starting {args.start:g} seconds into each source. Reference windows and beat timestamps are shifted by the same offset. First lock includes acquisition from this cold start.</p>' + ''.join(plots))
 
     run_info['complete'] = True
     (args.out / 'run.json').write_text(json.dumps(run_info, indent=2) + '\n')

@@ -328,3 +328,230 @@ fn explicit_detector_bounds_survive_reset_and_reject_an_out_of_range_advisor() {
         assert!((last.bpm.unwrap() - 300.).abs() < 0.2);
     }
 }
+
+#[test]
+fn sparse_neural_beats_can_acquire_half_the_particle_tempo() {
+    let mut clock = BeatClock::new(4);
+    for frame in 0..3000 {
+        let time = frame as f64 * 0.02;
+        let result = clock.update(
+            observation(time, time * 102.5 / 60., 205., true),
+            time + 0.04,
+            None,
+        );
+        if time > 15. {
+            assert!(
+                (result.bpm.expect("must have acquired") - 102.5).abs() < 0.2,
+                "{time}: {:?}",
+                result.bpm
+            );
+        }
+    }
+}
+
+#[test]
+fn sustained_missing_alternate_beats_can_correct_a_double_time_lock_continuously() {
+    let mut clock = BeatClock::new(4);
+    let mut previous: Option<Estimate> = None;
+    for frame in 0..3500 {
+        let time = frame as f64 * 0.02;
+        let (position, raw_bpm) = if time < 20. {
+            (time * 205. / 60., 205.)
+        } else {
+            (20. * 205. / 60. + (time - 20.) * 102.5 / 60., 102.5)
+        };
+        let guide = (time >= 20.).then_some(PulseGrid {
+            // Independent tempo agreement must not import this arbitrary phase.
+            anchor: 0.173,
+            period: 60. / 102.5,
+            provenance: Provenance::Detected,
+        });
+        let now = time + 0.04;
+        let result = clock.update(observation(time, position, raw_bpm, true), now, guide);
+        if (10. ..20.).contains(&time) {
+            assert!((result.bpm.unwrap() - 205.).abs() < 0.2);
+        }
+        if time >= 50. {
+            assert!(
+                (result.bpm.unwrap() - 102.5).abs() < 0.2,
+                "{time}: {:?}",
+                result.bpm
+            );
+        }
+        if let Some(beat) = result.grids[1] {
+            let bar = result.grids[0].unwrap();
+            let atom = result.grids[2].unwrap();
+            assert!((bar.period / beat.period - 4.).abs() < 1e-9);
+            assert!((beat.period / atom.period - 4.).abs() < 1e-9);
+            if let Some(old) = previous {
+                for (grid, old_grid) in result.grids.into_iter().zip(old.grids) {
+                    assert!(
+                        (grid.unwrap().position(now) - old_grid.unwrap().position(now)).abs()
+                            < 1e-9,
+                        "output phase jumped at {time}"
+                    );
+                }
+            }
+            previous = Some(result);
+        }
+    }
+}
+
+#[test]
+fn a_short_half_time_passage_does_not_replace_a_fast_lock() {
+    let mut clock = BeatClock::new(4);
+    for frame in 0..3000 {
+        let time = frame as f64 * 0.02;
+        let slow_passage = (20. ..23.).contains(&time);
+        let bpm = if slow_passage { 102.5 } else { 205. };
+        let guide = slow_passage.then_some(PulseGrid {
+            anchor: 0.173,
+            period: 60. / 102.5,
+            provenance: Provenance::Detected,
+        });
+        let result = clock.update(
+            observation(time, time * bpm / 60., bpm, true),
+            time + 0.04,
+            guide,
+        );
+        if time > 10. {
+            assert!(
+                (result.bpm.unwrap() - 205.).abs() < 0.2,
+                "{time}: {:?}",
+                result.bpm
+            );
+        }
+    }
+}
+
+#[test]
+fn strong_fast_beats_override_half_time_advice_above_the_soft_tempo_prior() {
+    for actual in [205., 220.] {
+        let mut clock = BeatClock::new(4);
+        let guide = PulseGrid {
+            anchor: 0.173,
+            period: 120. / actual,
+            provenance: Provenance::Detected,
+        };
+        for frame in 0..3000 {
+            let time = frame as f64 * 0.02;
+            let result = clock.update(
+                observation(time, time * actual / 60., actual, true),
+                time + 0.04,
+                Some(guide),
+            );
+            if time > 10. {
+                assert!(
+                    (result.bpm.unwrap() - actual).abs() < 0.2,
+                    "{actual} BPM at {time}: {:?}",
+                    result.bpm
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn half_time_detector_agreement_cannot_override_present_alternate_beats() {
+    for actual in [205., 220.] {
+        let mut clock = BeatClock::new(4);
+        let guide = PulseGrid {
+            anchor: 0.173,
+            period: 120. / actual,
+            provenance: Provenance::Detected,
+        };
+        for frame in 0..3000 {
+            let time = frame as f64 * 0.02;
+            let raw_bpm = if time < 20. { actual } else { actual / 2. };
+            let result = clock.update(
+                observation(time, time * actual / 60., raw_bpm, true),
+                time + 0.04,
+                Some(guide),
+            );
+            if time > 10. {
+                assert!(
+                    (result.bpm.unwrap() - actual).abs() < 0.2,
+                    "{actual} BPM at {time}: {:?}",
+                    result.bpm
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn half_time_advice_requires_neural_support_when_particle_tempos_disagree() {
+    for (slower_beats, alternating_particles) in [(true, true), (false, true), (false, false)] {
+        let mut clock = BeatClock::new(4);
+        for frame in 0..3000 {
+            let time = frame as f64 * 0.02;
+            let position = if slower_beats && time >= 20. {
+                20. * 205. / 60. + (time - 20.) * 102.5 / 60.
+            } else {
+                time * 205. / 60.
+            };
+            let raw_bpm = if time >= 20. && alternating_particles && frame / 50 % 2 == 0 {
+                102.5
+            } else {
+                205.
+            };
+            let guide = (time >= 20.).then_some(PulseGrid {
+                anchor: 0.173,
+                period: 60. / 102.5,
+                provenance: Provenance::Detected,
+            });
+            let result = clock.update(
+                observation(time, position, raw_bpm, true),
+                time + 0.04,
+                guide,
+            );
+            if (10. ..20.).contains(&time) || (!slower_beats && time >= 20.) {
+                assert!(
+                    (result.bpm.unwrap() - 205.).abs() < 0.2,
+                    "fast beats, alternating particles={alternating_particles}, {time}: {:?}",
+                    result.bpm
+                );
+            }
+            if slower_beats && time >= 40. {
+                assert!(
+                    (result.bpm.unwrap() - 102.5).abs() < 0.2,
+                    "slow beats, alternating particles={alternating_particles}, {time}: {:?}",
+                    result.bpm
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn expired_particle_endorsement_cannot_later_enable_half_time_advice() {
+    let mut clock = BeatClock::new(4);
+    for frame in 0..3500 {
+        let time = frame as f64 * 0.02;
+        // Every slower peak still lies on the established fast grid. The advisor
+        // alone must not turn one old particle vote into a permanent endorsement.
+        let actual = if time < 20. { 205. } else { 102.5 };
+        let raw_bpm = if (20. ..21.).contains(&time) {
+            102.5
+        } else {
+            205.
+        };
+        let guide = (time >= 20.).then_some(PulseGrid {
+            anchor: 0.173,
+            period: 60. / 102.5,
+            provenance: Provenance::Detected,
+        });
+        let result = clock.update(
+            observation(time, time * actual / 60., raw_bpm, true),
+            time + 0.04,
+            guide,
+        );
+        if time > 10. {
+            assert!(
+                (result.bpm.unwrap() - 205.).abs() < 0.2,
+                "{time}: {:?}",
+                result.bpm
+            );
+        }
+    }
+}

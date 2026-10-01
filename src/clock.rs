@@ -21,6 +21,13 @@ struct Fit {
     latest: f64,
 }
 
+#[derive(Clone, Copy)]
+struct Candidate {
+    grid: PulseGrid,
+    since: f64,
+    half_time: bool,
+}
+
 pub struct BeatClock {
     points: [Point; HISTORY],
     count: usize,
@@ -30,13 +37,14 @@ pub struct BeatClock {
     last_fit: f64,
     model: Option<PulseGrid>,
     output: Option<PulseGrid>,
-    candidate: Option<(PulseGrid, f64)>,
+    candidate: Option<Candidate>,
     last_good: f64,
     subdivision: u8,
     bar_offset: Option<f64>,
     meter: Option<u8>,
     atom_divisor: Option<f64>,
     outside_since: Option<(f64, f64)>,
+    half_vote: Option<(PulseGrid, f64)>,
     bounds: Option<(f64, f64)>,
 }
 impl BeatClock {
@@ -57,6 +65,7 @@ impl BeatClock {
             meter: None,
             atom_divisor: None,
             outside_since: None,
+            half_vote: None,
             bounds: None,
         }
     }
@@ -229,7 +238,7 @@ impl BeatClock {
                 let bpm = 60. / seed.period;
                 let factor = if bpm < 95. {
                     0.5
-                } else if bpm >= 220. {
+                } else if bpm >= 220. || (bpm > 200. && raw.evidence.is_some()) {
                     2.
                 } else {
                     1.
@@ -248,6 +257,10 @@ impl BeatClock {
                         },
                         now,
                     )
+                    // Near the upper edge of the soft prior, sparse fast music
+                    // is still plausible. Require strong neural support before
+                    // proposing half-time; keep resonator-only behavior unchanged.
+                    && (bpm >= 220. || factor == 0.5 || fit.score >= 0.8)
                     && challenger.is_none_or(|old| fit.score > old.score)
                 {
                     challenger = Some(fit);
@@ -266,6 +279,32 @@ impl BeatClock {
             if incumbent.is_none_or(|f| f.score < 0.45)
                 && let Some(other) = advisory.and_then(|g| self.search(g, now))
                 && challenger.is_none_or(|f| other.score > f.score + 0.05)
+            {
+                challenger = Some(other);
+            }
+            // Remember brief particle endorsements so frame-to-frame octave
+            // jitter does not erase otherwise consistent evidence. A half-time
+            // advisor cannot overrule particles that keep supporting fast beats.
+            if let Some(grid) = raw.grids[1]
+                && self
+                    .model
+                    .is_some_and(|old| (old.period / grid.period - 0.5).abs() < 0.03)
+            {
+                self.half_vote = Some((grid, now));
+            }
+            let recent_vote = self.half_vote.filter(|(_, time)| now - time <= 2.);
+            let half_advisory = guide.filter(|g| {
+                raw.evidence.is_some()
+                    && self
+                        .model
+                        .is_some_and(|old| (old.period / g.period - 0.5).abs() < 0.03)
+                    && recent_vote
+                        .is_some_and(|(vote, _)| (vote.period / g.period - 1.).abs() < 0.06)
+            });
+            if let Some(other) = half_advisory.and_then(|g| self.search(g, now))
+                && other.score >= 0.8
+                && incumbent.is_none_or(|old| other.score > old.score + 0.12)
+                && challenger.is_none_or(|old| other.score > old.score + 0.05)
             {
                 challenger = Some(other);
             }
@@ -296,9 +335,31 @@ impl BeatClock {
                     let ratio = old.period / fit.grid.period;
                     (ratio - 2.).abs() < 0.12 || (ratio - 0.5).abs() < 0.03
                 });
-                // Strong subdivisions do not prove that the musical beat doubled.
-                // Preserve a supported metrical level until its evidence disappears.
-                let ambiguous = harmonic && incumbent.is_some_and(|old| old.score >= 0.4);
+                // A double-time lock can keep fitting every second tick even after
+                // the detector has settled on the actual beat. Recover only when
+                // the slower grid explains the neural peaks substantially better
+                // and either the particles agree or strong neural support backs
+                // an independent advisor. Agreement never supplies beat phase.
+                let corroborated_half =
+                    guide.is_some_and(|g| (g.period / fit.grid.period - 1.).abs() < 0.025);
+                let half_time_correction = raw.evidence.is_some()
+                    && self
+                        .model
+                        .is_some_and(|old| (old.period / fit.grid.period - 0.5).abs() < 0.03)
+                    && (raw.grids[1]
+                        .is_some_and(|g| (g.period / fit.grid.period - 1.).abs() < 0.06)
+                        || (corroborated_half
+                            && fit.score >= 0.8
+                            && recent_vote.is_some_and(|(vote, _)| {
+                                (vote.period / fit.grid.period - 1.).abs() < 0.06
+                            })))
+                    && incumbent.is_some_and(|old| {
+                        old.score >= 0.4
+                            && fit.score > old.score + if corroborated_half { 0.12 } else { 0.2 }
+                    });
+                let ambiguous = harmonic
+                    && incumbent.is_some_and(|old| old.score >= 0.4)
+                    && !half_time_correction;
                 let better = !ambiguous && incumbent.is_none_or(|old| fit.score > old.score + 0.12);
                 if self.model.is_none() {
                     self.model = Some(fit.grid);
@@ -306,13 +367,19 @@ impl BeatClock {
                 } else if better {
                     let since = self
                         .candidate
-                        .filter(|(old, _)| {
-                            (old.period / fit.grid.period - 1.).abs() < 0.025
-                                && phase_error(*old, fit.grid, now).abs() < 0.12
+                        .filter(|old| {
+                            old.half_time == half_time_correction
+                                && (old.grid.period / fit.grid.period - 1.).abs() < 0.025
+                                && phase_error(old.grid, fit.grid, now).abs() < 0.12
                         })
-                        .map_or(now, |(_, since)| since);
-                    self.candidate = Some((fit.grid, since));
-                    if now - since >= 2. {
+                        .map_or(now, |old| old.since);
+                    self.candidate = Some(Candidate {
+                        grid: fit.grid,
+                        since,
+                        half_time: half_time_correction,
+                    });
+                    let confirmation = if half_time_correction { 6. } else { 2. };
+                    if now - since >= confirmation {
                         self.model = Some(fit.grid);
                         self.last_good = now;
                         self.candidate = None;
