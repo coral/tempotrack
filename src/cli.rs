@@ -20,9 +20,14 @@ pub struct Args {
     /// List compiled output drivers, then exit.
     #[arg(long)]
     pub list_outputs: bool,
+    /// List local MIDI output names and persistent IDs without opening audio.
+    #[arg(long)]
+    pub list_midi_outputs: bool,
     /// Output driver; repeat to enable distinct outputs. Headless default: stdout.
-    #[arg(long = "output", value_parser = ["stdout", "none"], action = clap::ArgAction::Append)]
+    #[arg(long = "output", value_parser = ["stdout", "none", "link", "osc", "midi", "rtpmidi"], action = clap::ArgAction::Append)]
     pub outputs: Vec<String>,
+    #[command(flatten)]
+    pub output_settings: OutputArgs,
     #[command(flatten)]
     pub settings: SettingsArgs,
 }
@@ -133,6 +138,7 @@ impl Args {
                 && !self.headless
                 && !self.settings.supplied()
                 && self.outputs.is_empty()
+                && !self.output_settings.supplied()
     }
     pub fn output_names(&self, gui: bool) -> Result<Vec<String>, Error> {
         if self.outputs.is_empty() {
@@ -149,5 +155,88 @@ impl Args {
             }
         }
         Ok(self.outputs.clone())
+    }
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct OutputArgs {
+    /// OSC receiver host:port; repeat for multiple receivers.
+    #[arg(long = "osc-target")]
+    pub osc_targets: Vec<String>,
+    #[arg(long)]
+    pub osc_prefix: Option<String>,
+    /// Exact local MIDI output name; repeat to select several ports.
+    #[arg(long = "midi-port")]
+    pub midi_ports: Vec<String>,
+    /// Persistent MIDI output ID from --list-midi-outputs.
+    #[arg(long = "midi-port-id")]
+    pub midi_port_ids: Vec<String>,
+    /// Create a virtual output named TempoTrack Clock.
+    #[arg(long)]
+    pub midi_virtual: bool,
+    #[arg(long)]
+    pub rtpmidi_name: Option<String>,
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65534))]
+    pub rtpmidi_port: Option<u16>,
+}
+impl OutputArgs {
+    pub fn supplied(&self) -> bool {
+        !self.osc_targets.is_empty()
+            || self.osc_prefix.is_some()
+            || !self.midi_ports.is_empty()
+            || !self.midi_port_ids.is_empty()
+            || self.midi_virtual
+            || self.rtpmidi_name.is_some()
+            || self.rtpmidi_port.is_some()
+    }
+    pub fn apply(&self, names: &[String]) -> Result<crate::output::config::OutputConfig, Error> {
+        use crate::output::config::{MidiPort, OutputConfig};
+        let mut config = OutputConfig {
+            link: names.iter().any(|s| s == "link"),
+            ..OutputConfig::default()
+        };
+        config.osc.enabled = names.iter().any(|s| s == "osc");
+        config.midi.enabled = names.iter().any(|s| s == "midi");
+        config.rtpmidi.enabled = names.iter().any(|s| s == "rtpmidi");
+        if (!self.osc_targets.is_empty() || self.osc_prefix.is_some()) && !config.osc.enabled {
+            return Err(Error::Config("OSC options require --output osc".into()));
+        }
+        if (!self.midi_ports.is_empty() || !self.midi_port_ids.is_empty() || self.midi_virtual)
+            && !config.midi.enabled
+        {
+            return Err(Error::Config("MIDI options require --output midi".into()));
+        }
+        if (self.rtpmidi_name.is_some() || self.rtpmidi_port.is_some()) && !config.rtpmidi.enabled {
+            return Err(Error::Config(
+                "RTP-MIDI options require --output rtpmidi".into(),
+            ));
+        }
+        config.osc.targets = self.osc_targets.clone();
+        if let Some(prefix) = &self.osc_prefix {
+            config.osc.prefix = prefix.clone();
+        }
+        config
+            .midi
+            .ports
+            .extend(self.midi_ports.iter().map(|name| MidiPort {
+                id: None,
+                name: name.clone(),
+            }));
+        config
+            .midi
+            .ports
+            .extend(self.midi_port_ids.iter().map(|id| MidiPort {
+                id: Some(id.clone()),
+                name: String::new(),
+            }));
+        config.midi.virtual_port = self.midi_virtual;
+        if let Some(name) = &self.rtpmidi_name {
+            config.rtpmidi.name = name.clone();
+        }
+        if let Some(port) = self.rtpmidi_port {
+            config.rtpmidi.port = port;
+        }
+        config.validate()?;
+        Ok(config)
     }
 }

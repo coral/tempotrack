@@ -1,0 +1,42 @@
+TempoTrack output-module dependency attribution
+
+ableton-link-rs 0.1.2
+  https://github.com/anweiss/ableton-link-rs
+  Declared license: GPL-3.0
+  Original license: vendor/ableton-link-rs/LICENSE
+  Local changes: vendor/ableton-link-rs/TEMPOTRACK-PATCH.md
+  The library-only packaging patch removes a demo-only rodio dependency that
+  otherwise conflicts with the application's ALSA dependency. It retains the
+  upstream version and library runtime dependencies.
+
+rtpmidi 0.4.4 — Jesse Higginson
+  https://github.com/iKadmium/rtp-midi-rs
+  Declared license: GPL-3.0-or-later
+  Original license: vendor/rtpmidi/LICENSE.md
+  Local changes: vendor/rtpmidi/PATCHES.md
+  The local patch implements TimingClock's empty payload in the encoder and
+  removes packaging/development references absent from the library-only copy.
+  Its optional mDNS integration is disabled; TempoTrack uses mdns-sd directly.
+
+midir 0.11.0 — Patrick Reisert
+  https://github.com/Boddlnagg/midir
+  Declared license: MIT
+
+rosc 0.11.4 — Andreas Linz
+  https://github.com/klingtnet/rosc
+  Declared license: MIT/Apache-2.0
+
+mdns-sd 0.21.4 — keepsimple
+  https://github.com/keepsimple1/mdns-sd
+  Declared license: Apache-2.0 OR MIT
+
+midi-types 0.2.1 — rust-midi contributors
+  https://github.com/rust-midi/midi-types
+  Declared license: MIT/Apache-2.0
+
+tokio 1.53.1 — Tokio Contributors
+  https://github.com/tokio-rs/tokio
+  Declared license: MIT
+
+This attribution records direct output dependencies. Cargo.lock records the
+resolved dependency graph; each package supplies its own complete license text.

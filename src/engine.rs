@@ -3,7 +3,7 @@ use crate::{
     audio::{self, AudioBlock, BLOCK, Capture},
     backend::{self, Estimate, TrackingBackend},
     config::{Config, LiveControls, Tracking},
-    output::{OutputDriver, OutputRunner},
+    output::{OutputDriver, OutputPublisher, OutputService, OutputStatus, config::OutputConfig},
     rhythm::{RhythmSnapshot, Transport},
 };
 use cpal::traits::StreamTrait;
@@ -40,6 +40,7 @@ pub struct Engine {
     events: Consumer<Event>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    outputs: OutputService,
 }
 impl Engine {
     pub fn spawn(drivers: Vec<Box<dyn OutputDriver>>) -> Result<Self, Error> {
@@ -48,20 +49,24 @@ impl Engine {
         let (event_tx, events) = RingBuffer::new(32);
         let stop = Arc::new(AtomicBool::new(false));
         let signal = stop.clone();
-        let mut outputs = Vec::new();
-        for driver in drivers {
-            outputs.push(OutputRunner::spawn(driver)?);
-        }
+        let (outputs, publisher) = OutputService::spawn(drivers)?;
         let thread = thread::Builder::new()
             .name("tempo-analysis".into())
-            .spawn(move || worker(command_rx, snapshot_tx, event_tx, signal, outputs))?;
+            .spawn(move || worker(command_rx, snapshot_tx, event_tx, signal, publisher))?;
         Ok(Self {
             commands,
             snapshots,
             events,
             stop,
             thread: Some(thread),
+            outputs,
         })
+    }
+    pub fn configure_outputs(&mut self, config: OutputConfig) -> Result<(), Error> {
+        self.outputs.configure(config)
+    }
+    pub fn output_status(&self) -> Vec<OutputStatus> {
+        self.outputs.status()
     }
     pub fn send(&mut self, command: Command) -> Result<(), Error> {
         if self.thread.as_ref().is_none_or(|t| t.is_finished()) {
@@ -89,7 +94,9 @@ impl Engine {
     pub fn shutdown(&mut self) -> Result<(), Error> {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            thread.join().map_err(|_| Error::WorkerStopped)?;
+            let result = thread.join();
+            self.outputs.shutdown();
+            result.map_err(|_| Error::WorkerStopped)?;
         }
         Ok(())
     }
@@ -330,7 +337,7 @@ fn worker(
     mut snapshots: Producer<RhythmSnapshot>,
     mut events: Producer<Event>,
     stop: Arc<AtomicBool>,
-    mut outputs: Vec<OutputRunner>,
+    mut outputs: OutputPublisher,
 ) {
     let mut session: Option<Session> = None;
     let mut snapshot = RhythmSnapshot::empty(Instant::now(), Default::default());
@@ -352,9 +359,7 @@ fn worker(
                     sequence += 1;
                     snapshot.sequence = sequence;
                     let _ = snapshots.push(snapshot);
-                    for output in &mut outputs {
-                        output.publish(snapshot);
-                    }
+                    outputs.publish(snapshot);
                     match Session::new(&config, generation) {
                         Ok((new, event)) => {
                             session = Some(new);
@@ -409,17 +414,7 @@ fn worker(
             sequence += 1;
             snapshot.sequence = sequence;
             let _ = snapshots.push(snapshot);
-            for output in &mut outputs {
-                output.publish(snapshot);
-            }
-            outputs.retain(|output| {
-                if output.stats.failed.load(Ordering::Acquire) {
-                    let _ = events.push(Event::OutputError(output.name.clone()));
-                    false
-                } else {
-                    true
-                }
-            });
+            outputs.publish(snapshot);
             next_publish = Instant::now() + Duration::from_millis(20);
         }
         thread::sleep(Duration::from_micros(500));
@@ -430,9 +425,7 @@ fn worker(
     snapshot.bpm = None;
     sequence += 1;
     snapshot.sequence = sequence;
-    for output in &mut outputs {
-        output.publish(snapshot);
-    }
+    outputs.publish(snapshot);
     // Drivers receive explicit shutdown even if their timeline queue was full.
 }
 

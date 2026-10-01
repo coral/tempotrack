@@ -48,35 +48,53 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    if args.list_midi_outputs {
+        for port in output::midi::list_ports()? {
+            println!("{}\t{}", port.id.unwrap_or_default(), port.name);
+        }
+        return Ok(());
+    }
     if args.list_outputs {
-        println!("stdout  Text tempo, level, and pulse status\nnone    Disable output");
+        println!(
+            "stdout   Text tempo, level, and pulse status\nnone     Disable output\nlink     Ableton Link tempo and beat\nosc      OSC tempo, phase, and pulses over UDP\nmidi     Local or virtual MIDI Clock\nrtpmidi  Discoverable network MIDI Clock"
+        );
         return Ok(());
     }
     let gui = args.wants_gui();
     let names = args.output_names(gui)?;
     let mut drivers = Vec::new();
-    for name in names {
-        if let Some(driver) = output::from_name(&name)? {
+    for name in &names {
+        if matches!(name.as_str(), "stdout" | "none")
+            && let Some(driver) = output::from_name(name)?
+        {
             drivers.push(driver);
         }
     }
+    let output_override = if args.outputs.is_empty() && !args.output_settings.supplied() && gui {
+        None
+    } else {
+        Some(args.output_settings.apply(&names)?)
+    };
     if gui {
         #[cfg(feature = "gui")]
         {
-            return ui::run(args.settings, drivers);
+            return ui::run(args.settings, drivers, output_override);
         }
         #[cfg(not(feature = "gui"))]
         {
             return Err("GUI support is not compiled in; rebuild with --features gui".into());
         }
     }
-    let config = args.settings.apply(Config::default())?;
+    let mut config = args.settings.apply(Config::default())?;
+    config.outputs = output_override.unwrap_or_default();
     let running = Arc::new(AtomicBool::new(true));
     let signal = running.clone();
     ctrlc::set_handler(move || signal.store(false, Ordering::Release))?;
     let mut engine = Engine::spawn(drivers)?;
+    engine.configure_outputs(config.outputs.clone())?;
     engine.start(config)?;
     let mut failure = None;
+    let mut output_status = vec![];
     while running.load(Ordering::Acquire) {
         while let Some(event) = engine.event() {
             match event {
@@ -90,10 +108,18 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     running.store(false, Ordering::Release);
                 }
                 Event::OutputError(name) => {
-                    failure = Some(format!("output {name} failed"));
-                    running.store(false, Ordering::Release);
+                    eprintln!("Output {name} failed; other outputs continue.");
                 }
             }
+        }
+        let statuses = engine.output_status();
+        if statuses != output_status {
+            for status in &statuses {
+                if !output_status.contains(status) {
+                    eprintln!("Output {}: {}", status.id, status.detail);
+                }
+            }
+            output_status = statuses;
         }
         let _ = engine.latest();
         if engine.is_finished() {

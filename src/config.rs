@@ -73,6 +73,7 @@ pub struct Config {
     /// None mixes all channels; otherwise a one-based source channel.
     pub channel: Option<u16>,
     pub live: LiveControls,
+    pub outputs: crate::output::config::OutputConfig,
     pub min_bpm: f64,
     pub max_bpm: f64,
     pub min_meter: u8,
@@ -87,6 +88,7 @@ impl Default for Config {
             input_index: None,
             channel: None,
             live: LiveControls::default(),
+            outputs: Default::default(),
             min_bpm: 55.,
             max_bpm: 215.,
             min_meter: 2,
@@ -97,6 +99,7 @@ impl Default for Config {
 impl Config {
     pub fn validate(&self) -> Result<(), Error> {
         self.live.validate()?;
+        self.outputs.validate()?;
         if self.channel == Some(0) {
             return Err(Error::Config("channels are one-based".into()));
         }

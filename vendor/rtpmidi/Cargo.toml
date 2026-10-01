@@ -1,0 +1,46 @@
+[package]
+name = "rtpmidi"
+version = "0.4.4"
+edition = "2024"
+authors = ["Jesse Higginson "]
+description = "A library for RTP-MIDI / AppleMIDI"
+license = "GPL-3.0-or-later"
+readme = false
+homepage = "https://github.com/iKadmium/rtp-midi-rs"
+repository = "https://github.com/iKadmium/rtp-midi-rs"
+include = ["src", "Cargo.toml", "LICENSE.md", "PATCHES.md"]
+
+[dependencies]
+mdns-sd = { version = "0.13.9", optional = true }
+hostname = { version = "0.4.1", optional = true }
+local-ip-address = { version = "0.6.5", optional = true }
+tracing-subscriber = { version = "0.3.19", optional = true, features = [
+    "fmt",
+    "env-filter",
+] }
+tokio = { version = "1" }
+rand = "0.9.1"
+futures = "0.3.31"
+tokio-util = "0.7.15"
+tracing = "0.1.41"
+bytes = "1.10.1"
+zerocopy = { version = "0.8.26", features = ["derive"] }
+midi-types = "0.2.1"
+thiserror = "2.0.12"
+anyhow = "1.0.98"
+
+[features]
+mdns = ["mdns-sd", "hostname", "local-ip-address"]
+examples = [
+    "default",
+    "tokio/rt-multi-thread",
+    "tokio/signal",
+    "tracing-subscriber",
+]
+default = ["tokio/net", "tokio/time", "tokio/rt", "tokio/macros", "tokio/sync"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[lints.clippy]
+uninlined_format_args = "warn"

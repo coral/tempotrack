@@ -1,4 +1,5 @@
 mod knob;
+mod outputs;
 
 use iced::{
     Alignment, Border, Color, Element, Fill, Font, Size, Subscription, Task, Theme, color,
@@ -16,7 +17,10 @@ use tempotrack::{
     cli::SettingsArgs,
     config::{Config, Tracking},
     engine::{Command, Engine, Event},
-    output::OutputDriver,
+    output::{
+        OutputDriver, OutputStatus,
+        config::{MidiPort, OutputConfig},
+    },
     rhythm::{PulseCursor, Quality, RhythmSnapshot, Transport},
 };
 
@@ -33,13 +37,18 @@ const ERROR: Color = color!(0xe8a192);
 pub fn run(
     args: SettingsArgs,
     drivers: Vec<Box<dyn OutputDriver>>,
+    output_override: Option<OutputConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (saved, warning) = match Config::load() {
         Ok(config) => (config, None),
         Err(error) => (Config::default(), Some(error.to_string())),
     };
-    let config = args.apply(saved)?;
+    let mut config = args.apply(saved)?;
+    if let Some(outputs) = output_override {
+        config.outputs = outputs;
+    }
     let mut engine = Engine::spawn(drivers)?;
+    engine.configure_outputs(config.outputs.clone())?;
     engine.start(config.clone())?;
     let now = Instant::now();
     let state = RefCell::new(Some(App {
@@ -48,6 +57,14 @@ pub fn run(
         config,
         engine: Some(engine),
         settings: false,
+        settings_tab: SettingsTab::Audio,
+        output_page: outputs::Page::Overview,
+        output_status: vec![],
+        output_status_at: now,
+        midi_ports: vec![],
+        midi_loading: false,
+        midi_error: None,
+        settings_error: None,
         running: true,
         error: warning,
         devices: vec![],
@@ -106,6 +123,14 @@ struct App {
     engine: Option<Engine>,
     snapshot: RhythmSnapshot,
     settings: bool,
+    settings_tab: SettingsTab,
+    output_page: outputs::Page,
+    output_status: Vec<OutputStatus>,
+    output_status_at: Instant,
+    midi_ports: Vec<MidiPort>,
+    midi_loading: bool,
+    midi_error: Option<String>,
+    settings_error: Option<String>,
     running: bool,
     error: Option<String>,
     devices: Vec<InputDevice>,
@@ -130,6 +155,9 @@ enum Message {
     Tab(bool),
     Silence(bool),
     Settings(bool),
+    SettingsTab(SettingsTab),
+    Output(outputs::Message),
+    MidiPorts(Result<Vec<MidiPort>, String>),
     Apply,
     Refresh,
     Devices(Result<Vec<InputDevice>, String>),
@@ -140,6 +168,11 @@ enum Message {
     Close,
     Closed(Result<(), String>),
     Dismiss,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Audio,
+    Outputs,
 }
 #[derive(Debug, Clone, Copy)]
 enum Field {
@@ -223,6 +256,7 @@ struct Draft {
     max_bpm: String,
     min_meter: String,
     max_meter: String,
+    rtp_port: String,
 }
 impl Draft {
     fn new(config: Config) -> Self {
@@ -232,6 +266,7 @@ impl Draft {
             max_bpm: config.max_bpm.to_string(),
             min_meter: config.min_meter.to_string(),
             max_meter: config.max_meter.to_string(),
+            rtp_port: config.outputs.rtpmidi.port.to_string(),
             config,
         }
     }
@@ -260,6 +295,8 @@ impl Draft {
         config.max_bpm = number(&self.max_bpm, "maximum tempo")?;
         config.min_meter = number(&self.min_meter, "minimum meter")?;
         config.max_meter = number(&self.max_meter, "maximum meter")?;
+        config.outputs.rtpmidi.port = number(&self.rtp_port, "RTP-MIDI port")?;
+        config.outputs.validate().map_err(|e| e.to_string())?;
         config.validate().map_err(|e| e.to_string())?;
         Ok(config)
     }
@@ -322,6 +359,13 @@ impl App {
             Message::Tick(now) => {
                 self.now = now;
                 if let Some(engine) = &mut self.engine {
+                    if self.settings
+                        && now.saturating_duration_since(self.output_status_at)
+                            >= Duration::from_millis(250)
+                    {
+                        self.output_status = engine.output_status();
+                        self.output_status_at = now;
+                    }
                     if let Some(snapshot) = engine.latest() {
                         self.snapshot = snapshot;
                     }
@@ -337,7 +381,7 @@ impl App {
                                 self.running = false;
                             }
                             Event::OutputError(name) => {
-                                self.error = Some(format!("Output {name} failed"))
+                                self.settings_error = Some(format!("Output {name} failed"))
                             }
                         }
                     }
@@ -446,8 +490,27 @@ impl App {
                 self.settings = open;
                 if open {
                     self.draft = Draft::new(self.config.clone());
+                    self.settings_error = None;
                 }
                 self.editor = None;
+            }
+            Message::SettingsTab(tab) => {
+                self.settings_tab = tab;
+                self.editor = None;
+                if tab == SettingsTab::Outputs && self.midi_ports.is_empty() && !self.midi_loading {
+                    return self.refresh_midi();
+                }
+            }
+            Message::Output(message) => return self.update_output(message),
+            Message::MidiPorts(result) => {
+                self.midi_loading = false;
+                match result {
+                    Ok(ports) => {
+                        self.midi_ports = ports;
+                        self.midi_error = None;
+                    }
+                    Err(error) => self.midi_error = Some(error),
+                }
             }
             Message::Refresh => return discover(),
             Message::Devices(result) => match result {
@@ -478,16 +541,28 @@ impl App {
             Message::Field(field, value) => *self.draft.field(field) = value,
             Message::Apply => match self.draft.parse() {
                 Ok(config) => {
+                    let audio_changed = audio_settings_changed(&self.config, &config);
+                    if self.config.outputs != config.outputs
+                        && let Some(engine) = &mut self.engine
+                        && let Err(error) = engine.configure_outputs(config.outputs.clone())
+                    {
+                        self.settings_error = Some(error.to_string());
+                        return Task::none();
+                    }
                     self.config = config;
-                    self.error = None;
-                    self.persist();
-                    if self.running {
+                    self.settings_error = None;
+                    if let Err(error) = self.config.save() {
+                        self.settings_error = Some(error.to_string());
+                    }
+                    if self.running && audio_changed {
                         self.restart();
                     }
-                    self.settings = false;
+                    if self.settings_error.is_none() {
+                        self.settings = false;
+                    }
                     self.editor = None;
                 }
-                Err(error) => self.error = Some(error),
+                Err(error) => self.settings_error = Some(error),
             },
             Message::Dismiss => self.error = None,
             Message::Close => {
@@ -514,7 +589,7 @@ impl App {
     }
     fn view(&self) -> Element<'_, Message> {
         if self.settings {
-            container(self.settings_view().spacing(12))
+            container(self.settings_view().spacing(8))
                 .padding(16)
                 .height(Fill)
                 .width(Fill)
@@ -805,7 +880,7 @@ impl App {
         .width(Fill)
         .into()
     }
-    fn settings_view(&self) -> iced::widget::Column<'_, Message> {
+    fn audio_settings(&self) -> iced::widget::Column<'_, Message> {
         let draft = &self.draft;
         let host = draft
             .config
@@ -853,7 +928,7 @@ impl App {
             .min(64);
         let mut channels = vec!["Mix".to_owned()];
         channels.extend((1..=max_channels).map(|n| n.to_string()));
-        let mut body = column![].spacing(8);
+        let mut body = column![].spacing(6);
         if let Some(error) = &self.error {
             body = body.push(
                 column![
@@ -928,7 +1003,7 @@ impl App {
                     ]
                     .spacing(24)
                 ]
-                .spacing(8),
+                .spacing(4),
             )
             .push(divider())
             .push(
@@ -956,7 +1031,14 @@ impl App {
                 ]
                 .spacing(8),
             );
-        column![
+        body
+    }
+    fn settings_view(&self) -> iced::widget::Column<'_, Message> {
+        let body = match self.settings_tab {
+            SettingsTab::Audio => self.audio_settings(),
+            SettingsTab::Outputs => self.outputs_view(),
+        };
+        let mut result = column![
             row![
                 text("Settings").size(20).font(medium_font()),
                 space::horizontal(),
@@ -966,6 +1048,11 @@ impl App {
                     .style(quiet_button)
             ]
             .align_y(Alignment::Center),
+            row![
+                self.settings_tab_button("Audio", SettingsTab::Audio),
+                self.settings_tab_button("Outputs", SettingsTab::Outputs),
+            ]
+            .spacing(6),
             scrollable(body.padding(iced::Padding {
                 right: 8.,
                 ..Default::default()
@@ -977,13 +1064,40 @@ impl App {
                     .margin(1)
             ))
             .height(Fill),
+        ];
+        if let Some(error) = &self.settings_error {
+            result = result.push(text(error).size(10).color(ERROR));
+        }
+        result.push(
             button(container(text("Apply settings").size(12)).center_x(Fill))
                 .padding([8, 12])
                 .width(Fill)
                 .on_press(Message::Apply)
                 .style(primary_button),
-        ]
+        )
     }
+    fn settings_tab_button(&self, label: &'static str, tab: SettingsTab) -> Element<'_, Message> {
+        let active = self.settings_tab == tab;
+        button(container(text(label).size(11)).center_x(Fill))
+            .on_press(Message::SettingsTab(tab))
+            .padding([6, 8])
+            .width(Fill)
+            .style(move |theme, status| {
+                if active {
+                    primary_button(theme, status)
+                } else {
+                    quiet_button(theme, status)
+                }
+            })
+            .into()
+    }
+}
+
+/// Outputs can be reconfigured without invalidating the audio-derived clock.
+fn audio_settings_changed(previous: &Config, next: &Config) -> bool {
+    let mut previous = previous.clone();
+    previous.outputs = next.outputs.clone();
+    previous != *next
 }
 
 fn input_field(value: &str, field: Field) -> Element<'_, Message> {
@@ -1122,6 +1236,14 @@ mod tests {
             engine: None,
             snapshot: RhythmSnapshot::empty(now, Tracking::Assisted),
             settings: true,
+            settings_tab: SettingsTab::Audio,
+            output_page: outputs::Page::Overview,
+            output_status: vec![],
+            output_status_at: now,
+            midi_ports: vec![],
+            midi_loading: false,
+            midi_error: None,
+            settings_error: None,
             running: false,
             error: None,
             devices: vec![],
@@ -1154,5 +1276,61 @@ mod tests {
         let _ = app.update(Message::EditorFocus(Parameter::Hold, false));
         assert!(app.editor.is_none());
         assert_eq!(app.draft.config.live.silence_hold_ms, 200);
+    }
+    #[test]
+    fn output_only_changes_preserve_audio_and_apply_is_explicit() {
+        let mut app = settings_app();
+        let _ = app.update(Message::Output(outputs::Message::Enable(
+            outputs::Page::Link,
+            true,
+        )));
+        let _ = app.update(Message::Output(outputs::Message::AddOsc));
+        let _ = app.update(Message::Output(outputs::Message::OscTarget(
+            0,
+            "127.0.0.1:7000".into(),
+        )));
+        let draft = app.draft.parse().unwrap();
+        assert!(draft.outputs.link);
+        assert_eq!(draft.outputs.osc.targets, ["127.0.0.1:7000"]);
+        assert!(!app.config.outputs.link);
+        assert!(!audio_settings_changed(&app.config, &draft));
+        let mut audio = draft;
+        audio.live.silence_hold_ms += 100;
+        assert!(audio_settings_changed(&app.config, &audio));
+        let _ = app.update(Message::Settings(false));
+        let _ = app.update(Message::Settings(true));
+        assert_eq!(app.draft.config.outputs, app.config.outputs);
+    }
+    #[test]
+    fn invalid_output_draft_stays_in_settings_without_input_error() {
+        let mut app = settings_app();
+        let _ = app.update(Message::Output(outputs::Message::Enable(
+            outputs::Page::Osc,
+            true,
+        )));
+        let _ = app.update(Message::Apply);
+        assert!(app.settings);
+        assert!(app.settings_error.is_some());
+        assert!(app.error.is_none());
+        assert!(!app.config.outputs.osc.enabled);
+    }
+    #[test]
+    fn midi_selections_support_multiple_ports_and_removal() {
+        let mut app = settings_app();
+        let first = MidiPort {
+            id: Some("1".into()),
+            name: "First".into(),
+        };
+        let second = MidiPort {
+            id: Some("2".into()),
+            name: "Second".into(),
+        };
+        for port in [first.clone(), second.clone(), first.clone()] {
+            let _ = app.update(Message::Output(outputs::Message::MidiPort(port, true)));
+        }
+        assert_eq!(app.draft.config.outputs.midi.ports.len(), 2);
+        let _ = app.update(Message::Output(outputs::Message::MidiPort(first, false)));
+        assert_eq!(app.draft.config.outputs.midi.ports, [second]);
+        assert!(app.config.outputs.midi.ports.is_empty());
     }
 }

@@ -1,0 +1,44 @@
+[package]
+name = "ableton-link-rs"
+version = "0.1.2"
+edition = "2021"
+autoexamples = false
+autobins = false
+description = "Native Rust implementation of the Ableton Link protocol"
+license = "GPL-3.0"
+repository = "https://github.com/anweiss/ableton-link-rs"
+exclude = [
+    "vendor/",
+    "target/",
+    ".vscode/",
+    ".idea/",
+    "Dockerfile",
+    ".dockerignore",
+    "test_interop.sh",
+    "*.tar",
+    "*.log",
+    ".DS_Store",
+    ".git/",
+]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rand = "0.8.4"
+tokio = { version = "1", features = ["full"] }
+bincode = { version = "2.0.0-rc.3", features = ["derive", "serde"] }
+thiserror = "1.0.48"
+socket2 = "0.5.3"
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"
+hex = "0.4.3"
+async-trait = "0.1.73"
+chrono = "0.4.31"
+local-ip-address = "0.5.6"
+termios = "0.3"
+triple_buffer = "8.1.1"
+if-addrs = "0.10.2"
+
+[dependencies.libc]
+version = "0.2"
+
