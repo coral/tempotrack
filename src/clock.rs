@@ -28,6 +28,14 @@ struct Candidate {
     half_time: bool,
 }
 
+#[derive(Clone, Copy)]
+struct BarCandidate {
+    offset: f64,
+    meter: u8,
+    last_downbeat: f64,
+    confirmations: u8,
+}
+
 pub struct BeatClock {
     points: [Point; HISTORY],
     count: usize,
@@ -42,6 +50,9 @@ pub struct BeatClock {
     subdivision: u8,
     bar_offset: Option<f64>,
     meter: Option<u8>,
+    meter_bounds: (u8, u8),
+    last_downbeat: Option<f64>,
+    bar_candidate: Option<BarCandidate>,
     atom_divisor: Option<f64>,
     outside_since: Option<(f64, f64)>,
     half_vote: Option<(PulseGrid, f64)>,
@@ -63,6 +74,9 @@ impl BeatClock {
             subdivision,
             bar_offset: None,
             meter: None,
+            meter_bounds: (2, 12),
+            last_downbeat: None,
+            bar_candidate: None,
             atom_divisor: None,
             outside_since: None,
             half_vote: None,
@@ -73,12 +87,78 @@ impl BeatClock {
     pub fn for_config(config: &crate::config::Config) -> Self {
         let mut clock = Self::new(crate::config::ATOM_SUBDIVISION);
         clock.bounds = Some((config.min_bpm, config.max_bpm));
+        clock.meter_bounds = (config.min_meter, config.max_meter);
         clock
     }
     pub fn reset(&mut self) {
         let bounds = self.bounds;
+        let meter_bounds = self.meter_bounds;
         *self = Self::new(self.subdivision);
         self.bounds = bounds;
+        self.meter_bounds = meter_bounds;
+    }
+    /// Correct the bar label only after distinct downbeats corroborate it.
+    /// The continuous beat/atom clocks never move when beat one is relabeled.
+    fn observe_bar(&mut self, raw: Estimate, beat: PulseGrid, now: f64) {
+        let Some(bar) = raw.grids[0].filter(|g| g.valid()) else {
+            return;
+        };
+        if bar.anchor > now
+            || now - bar.anchor > beat.period * 1.5
+            || self
+                .last_downbeat
+                .is_some_and(|last| bar.anchor <= last + beat.period * 0.5)
+        {
+            return;
+        }
+        self.last_downbeat = Some(bar.anchor);
+        // A raw octave error must not reinterpret bar length on the stable clock.
+        if raw.grids[1].is_none_or(|g| !g.valid() || (g.period / beat.period - 1.).abs() > 0.12) {
+            self.bar_candidate = None;
+            return;
+        }
+        let meter = raw
+            .meter
+            .unwrap_or_else(|| (bar.period / beat.period).round().clamp(2., 12.) as u8);
+        let position = beat.position(bar.anchor);
+        if !(self.meter_bounds.0..=self.meter_bounds.1).contains(&meter)
+            || (position - position.round()).abs() > 0.2
+        {
+            self.bar_candidate = None;
+            return;
+        }
+        let offset = position.round().rem_euclid(f64::from(meter));
+        if self.bar_offset.is_none() {
+            self.bar_offset = Some(offset);
+            self.meter = Some(meter);
+            return;
+        }
+        if self.meter == Some(meter) && self.bar_offset == Some(offset) {
+            self.bar_candidate = None;
+            return;
+        }
+        let confirmations = self
+            .bar_candidate
+            .filter(|candidate| {
+                let elapsed_beats = (bar.anchor - candidate.last_downbeat) / beat.period;
+                candidate.meter == meter
+                    && candidate.offset == offset
+                    && elapsed_beats >= f64::from(meter) - 0.25
+                    && elapsed_beats <= f64::from(meter) * 2.5
+            })
+            .map_or(1, |candidate| candidate.confirmations + 1);
+        if confirmations >= 3 {
+            self.meter = Some(meter);
+            self.bar_offset = Some(offset);
+            self.bar_candidate = None;
+        } else {
+            self.bar_candidate = Some(BarCandidate {
+                offset,
+                meter,
+                last_downbeat: bar.anchor,
+                confirmations,
+            });
+        }
     }
     fn push(&mut self, time: f64, weight: f64) {
         if !time.is_finite() || !weight.is_finite() || weight <= 0. {
@@ -418,21 +498,7 @@ impl BeatClock {
             model
         };
         self.output = Some(beat);
-        // Keep a single coherent beat counter for bar and subdivisions. A noisy
-        // meter/downbeat hypothesis must not move a running bar counter.
-        if self.bar_offset.is_none()
-            && let Some(bar) = raw.grids[0]
-        {
-            let meter = raw
-                .meter
-                .unwrap_or_else(|| (bar.period / model.period).round().clamp(2., 12.) as u8);
-            self.meter = Some(meter);
-            self.bar_offset = Some(
-                beat.position(bar.anchor)
-                    .round()
-                    .rem_euclid(f64::from(meter)),
-            );
-        }
+        self.observe_bar(raw, beat, now);
         let bar = self
             .bar_offset
             .zip(self.meter)

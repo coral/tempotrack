@@ -15,6 +15,7 @@ pub struct LinkOutput {
     runtime: Runtime,
     snapshot: Option<RhythmSnapshot>,
     aligned: bool,
+    bar_label: Option<BarLabel>,
     peers: usize,
     next_publish: Instant,
     stopped: bool,
@@ -51,6 +52,7 @@ impl LinkOutput {
             runtime,
             snapshot: None,
             aligned: false,
+            bar_label: None,
             peers: 0,
             next_publish: Instant::now(),
             stopped: false,
@@ -81,6 +83,54 @@ fn corrected_beat(current: f64, desired: f64, quantum: f64, bpm: f64) -> f64 {
     current + error.clamp(-limit, limit)
 }
 
+/// Bar numbering is discrete even while the shared beat grid slews continuously.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BarLabel {
+    generation: u64,
+    meter: u8,
+    offset: Option<u8>,
+}
+
+impl BarLabel {
+    fn from_snapshot(snapshot: &RhythmSnapshot) -> Self {
+        let meter = snapshot.meter.filter(|meter| *meter > 0).unwrap_or(4);
+        let offset = snapshot.grids[0]
+            .filter(|bar| bar.valid())
+            .zip(snapshot.grids[1].filter(|beat| beat.valid()))
+            .map(|(bar, beat)| {
+                beat.position(bar.anchor)
+                    .round()
+                    .rem_euclid(f64::from(meter)) as u8
+            });
+        Self {
+            generation: snapshot.generation,
+            meter,
+            offset,
+        }
+    }
+}
+
+fn publication_beat(
+    current: f64,
+    desired: f64,
+    bpm: f64,
+    previous: Option<BarLabel>,
+    label: BarLabel,
+) -> f64 {
+    let Some(previous) = previous.filter(|old| old.generation == label.generation) else {
+        return desired;
+    };
+    // A confirmed downbeat correction changes which existing beat is beat one.
+    // Move that label immediately rather than slewing through a whole beat over
+    // a minute. Integer relabeling preserves the metronome's fractional phase.
+    let current = if previous != label {
+        current + (desired - current).round()
+    } else {
+        current
+    };
+    corrected_beat(current, desired, f64::from(label.meter), bpm)
+}
+
 impl OutputDriver for LinkOutput {
     fn name(&self) -> &str {
         "link"
@@ -88,6 +138,7 @@ impl OutputDriver for LinkOutput {
     fn reset(&mut self) {
         self.snapshot = None;
         self.aligned = false;
+        self.bar_label = None;
         self.next_publish = Instant::now();
     }
     fn on_timeline(&mut self, snapshot: RhythmSnapshot) -> Result<(), OutputError> {
@@ -133,11 +184,14 @@ impl OutputDriver for LinkOutput {
         let at = self.link.clock().micros();
         let mut state = self.link.capture_app_session_state();
         state.set_tempo(bpm, at);
-        let beat = if self.aligned {
-            corrected_beat(state.beat_at_time(at, quantum), desired, quantum, bpm)
-        } else {
-            desired
-        };
+        let label = BarLabel::from_snapshot(&snapshot);
+        let beat = publication_beat(
+            state.beat_at_time(at, quantum),
+            desired,
+            bpm,
+            self.bar_label.filter(|_| self.aligned),
+            label,
+        );
         state.force_beat_at_time(beat, at, quantum);
         self.runtime
             .block_on(async {
@@ -149,6 +203,7 @@ impl OutputDriver for LinkOutput {
             })
             .map_err(|_| OutputError::Driver("Link timeline publication timed out".into()))?;
         self.aligned = true;
+        self.bar_label = Some(label);
         Ok(Some(self.next_publish))
     }
     fn status(&self) -> String {
@@ -193,6 +248,84 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_downbeat_relabels_link_without_moving_the_beat() {
+        use ableton_link_rs::link::SessionState;
+
+        let old = BarLabel {
+            generation: 1,
+            meter: 4,
+            offset: Some(0),
+        };
+        let new = BarLabel {
+            offset: Some(1),
+            ..old
+        };
+        let mut state = SessionState::default();
+        state.set_tempo(120., Default::default());
+        let at = state.time_at_beat(12.25, 4.);
+        let next_tick = state.time_at_beat(13., 4.);
+        let beat = publication_beat(state.beat_at_time(at, 4.), 11.25, 120., Some(old), new);
+        state.force_beat_at_time(beat, at, 4.);
+        assert!((state.phase_at_time(at, 4.) - 3.25).abs() < 0.00001);
+        assert!((state.beat_at_time(at, 4.).rem_euclid(1.) - 0.25).abs() < 0.00001);
+        assert!(
+            (state.time_at_beat(12., 4.) - next_tick)
+                .num_microseconds()
+                .unwrap()
+                .abs()
+                <= 1
+        );
+
+        // The next publication keeps the corrected label, including tempo updates.
+        state.set_tempo(125., at);
+        let desired = 11.251;
+        let beat = publication_beat(state.beat_at_time(at, 4.), desired, 125., Some(new), new);
+        state.force_beat_at_time(beat, at, 4.);
+        assert!((state.beat_at_time(at, 4.) - desired).abs() < 0.00001);
+    }
+
+    #[test]
+    fn meter_changes_relabel_immediately_but_keep_fractional_correction_bounded() {
+        let old = BarLabel {
+            generation: 1,
+            meter: 4,
+            offset: Some(0),
+        };
+        let new = BarLabel { meter: 3, ..old };
+        let beat = publication_beat(12.25, 11.35, 120., Some(old), new);
+        assert!((beat - 11.254).abs() < 1e-10);
+        // An ordinary phase discrepancy still slews instead of jumping a beat.
+        assert!((publication_beat(12.25, 11.35, 120., Some(old), old) - 12.246).abs() < 1e-10);
+        let restarted = BarLabel {
+            generation: 2,
+            ..old
+        };
+        assert_eq!(
+            publication_beat(12.25, 0.1, 120., Some(old), restarted),
+            0.1
+        );
+    }
+
+    #[test]
+    fn bar_label_ignores_continuous_grid_slew_and_whole_bars() {
+        let mut snapshot = RhythmSnapshot::empty(Instant::now(), Tracking::Assisted);
+        snapshot.meter = Some(4);
+        for (anchor, period, offset) in [(1., 0.5, 1.), (-17., 0.49, 1.), (40., 0.51, 5.)] {
+            snapshot.grids[1] = Some(PulseGrid {
+                anchor,
+                period,
+                provenance: Provenance::Derived,
+            });
+            snapshot.grids[0] = Some(PulseGrid {
+                anchor: anchor + offset * period,
+                period: 4. * period,
+                provenance: Provenance::Derived,
+            });
+            assert_eq!(BarLabel::from_snapshot(&snapshot).offset, Some(1));
+        }
+    }
+
+    #[test]
     fn target_uses_effective_grid_tempo_downbeat_and_offset() {
         let now = Instant::now();
         let mut snapshot = RhythmSnapshot::empty(now, Tracking::Assisted);
@@ -219,6 +352,71 @@ mod tests {
         assert_eq!((bpm, quantum), (120., 3.));
         assert!((beat - 2.8).abs() < 1e-10);
         assert!(target(&snapshot, now + Duration::from_secs(2)).is_none());
+    }
+
+    #[test]
+    fn link_publication_and_visual_bar_use_the_same_projected_phase() {
+        use ableton_link_rs::link::SessionState;
+
+        let reference = Instant::now();
+        let now = reference + Duration::from_millis(125);
+        let mut snapshot = RhythmSnapshot::empty(reference, Tracking::Assisted);
+        snapshot.transport = Transport::Tracking;
+        snapshot.valid_until = reference + Duration::from_secs(5);
+        snapshot.source_time = 5.;
+        let mut state = SessionState::default();
+        let at = Default::default();
+        let mut previous = None;
+
+        // Consecutive publications: initial lock, confirmed downbeat correction,
+        // meter correction, continuous tempo slew, and a small output offset edit.
+        for (period, meter, bar_offset, output_offset) in [
+            (0.5, 4, 0., 0.1),
+            (0.5, 4, 1., 0.1),
+            (0.5, 3, 1., 0.1),
+            (0.499, 3, 1., 0.1),
+            (0.499, 3, 1., 0.1005),
+        ] {
+            snapshot.offset_seconds = output_offset;
+            snapshot.meter = Some(meter);
+            // Frequency changes pivot around the current beat position, as in
+            // BeatClock. Keep offset separate so both projections must apply it.
+            let anchor = 5.125 - 0.1 - 10.25 * period;
+            snapshot.grids[1] = Some(PulseGrid {
+                anchor,
+                period,
+                provenance: Provenance::Derived,
+            });
+            snapshot.grids[0] = Some(PulseGrid {
+                anchor: anchor + bar_offset * period,
+                period: period * f64::from(meter),
+                provenance: Provenance::Derived,
+            });
+            let (bpm, desired, quantum) = target(&snapshot, now).unwrap();
+            let label = BarLabel::from_snapshot(&snapshot);
+            state.set_tempo(bpm, at);
+            let beat = publication_beat(
+                state.beat_at_time(at, quantum),
+                desired,
+                bpm,
+                previous,
+                label,
+            );
+            state.force_beat_at_time(beat, at, quantum);
+            previous = Some(label);
+
+            let visual = snapshot.phase(0, now).unwrap();
+            let published = state.phase_at_time(at, quantum) / quantum;
+            assert!((visual - published).abs() < 0.00001);
+
+            // Their clocks must continue agreeing between publications too.
+            let later = state.time_at_beat(state.beat_at_time(at, quantum) + 0.25, quantum);
+            let visual = snapshot
+                .phase(0, now + Duration::from_secs_f64(period * 0.25))
+                .unwrap();
+            let published = state.phase_at_time(later, quantum) / quantum;
+            assert!((visual - published).abs() < 0.00001);
+        }
     }
 
     /// The probe is built from the official Ableton C++ library, not this Rust crate.

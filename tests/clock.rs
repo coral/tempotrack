@@ -555,3 +555,135 @@ fn expired_particle_endorsement_cannot_later_enable_half_time_advice() {
         }
     }
 }
+
+/// Beat evidence stays at 120 BPM while only the bar hypothesis changes. Unlike
+/// `observation`, the downbeat anchor advances once per bar, not once per beat.
+fn bar_observation(time: f64, meter: u8, origin: f64) -> Estimate {
+    let mut raw = observation(time, time * 2., 120., true);
+    let period = 0.5 * f64::from(meter);
+    let anchor = origin + ((time - origin) / period).floor() * period;
+    raw.meter = Some(meter);
+    raw.grids[0] = (anchor >= 0.).then_some(PulseGrid {
+        anchor,
+        period,
+        provenance: Provenance::Detected,
+    });
+    raw
+}
+
+fn assert_bar_alignment(result: Estimate, time: f64, meter: u8, origin: f64) {
+    assert_eq!(result.meter, Some(meter), "meter at {time}");
+    let bar = result.grids[0].expect("a confirmed bar grid");
+    let beat = result.grids[1].unwrap();
+    assert!((bar.period / beat.period - f64::from(meter)).abs() < 1e-9);
+    let error = (bar.phase(origin) + 0.5).rem_euclid(1.) - 0.5;
+    assert!(
+        error.abs() * bar.period < 0.005,
+        "bar origin at {time}: {bar:?}, expected a downbeat at {origin}"
+    );
+}
+
+fn assert_beat_and_atom_continuous(previous: Estimate, current: Estimate, now: f64) {
+    for level in [1, 2] {
+        if let (Some(old), Some(new)) = (previous.grids[level], current.grids[level]) {
+            assert!(
+                (new.position(now) - old.position(now)).abs() < 1e-8,
+                "pulse level {level} jumped while correcting the bar at {now}"
+            );
+        }
+    }
+}
+
+#[test]
+fn later_downbeats_correct_an_initial_one_beat_bar_error_without_moving_beats() {
+    let mut clock = BeatClock::new(4);
+    let mut previous = Estimate::default();
+    for frame in 0..1_500 {
+        let time = frame as f64 * 0.02;
+        let origin = if time < 12. { 0.5 } else { 0. };
+        let result = clock.update(bar_observation(time, 4, origin), time + 0.04, None);
+        assert_beat_and_atom_continuous(previous, result, time + 0.04);
+        if (10. ..12.).contains(&time) {
+            assert_bar_alignment(result, time, 4, 0.5);
+        }
+        if time >= 18. {
+            assert_bar_alignment(result, time, 4, 0.);
+        }
+        previous = result;
+    }
+}
+
+#[test]
+fn a_new_tracks_downbeats_can_move_the_bar_by_one_beat_without_reset() {
+    let mut clock = BeatClock::new(4);
+    let mut previous = Estimate::default();
+    for frame in 0..2_000 {
+        let time = frame as f64 * 0.02;
+        // No silence or reset: the next track has the same tempo but its first
+        // downbeat is one beat later than the established bar boundary.
+        let origin = if time < 20.5 { 0. } else { 0.5 };
+        let result = clock.update(bar_observation(time, 4, origin), time + 0.04, None);
+        assert_beat_and_atom_continuous(previous, result, time + 0.04);
+        if (10. ..20.5).contains(&time) {
+            assert_bar_alignment(result, time, 4, 0.);
+        }
+        if time >= 27. {
+            assert_bar_alignment(result, time, 4, 0.5);
+        }
+        previous = result;
+    }
+}
+
+#[test]
+fn repeated_frames_of_one_wrong_downbeat_do_not_move_a_confirmed_bar() {
+    let mut clock = BeatClock::new(4);
+    for frame in 0..1_800 {
+        let time = frame as f64 * 0.02;
+        // A single false downbeat remains the detector's latest event for 75
+        // frames. Those repeated reports must not count as independent votes.
+        let origin = if (20.5..22.).contains(&time) { 0.5 } else { 0. };
+        let result = clock.update(bar_observation(time, 4, origin), time + 0.04, None);
+        if time >= 10. {
+            assert_bar_alignment(result, time, 4, 0.);
+        }
+    }
+}
+
+#[test]
+fn consistent_downbeats_replace_an_initial_wrong_meter() {
+    let mut clock = BeatClock::new(4);
+    let mut previous = Estimate::default();
+    for frame in 0..1_500 {
+        let time = frame as f64 * 0.02;
+        let meter = if time < 12. { 3 } else { 4 };
+        let result = clock.update(bar_observation(time, meter, 0.), time + 0.04, None);
+        assert_beat_and_atom_continuous(previous, result, time + 0.04);
+        if (10. ..12.).contains(&time) {
+            assert_bar_alignment(result, time, 3, 0.);
+        }
+        if time >= 18. {
+            assert_bar_alignment(result, time, 4, 0.);
+        }
+        previous = result;
+    }
+}
+
+#[test]
+fn bar_confirmation_respects_an_explicit_triple_meter_range() {
+    let config = tempotrack::config::Config {
+        min_meter: 3,
+        max_meter: 3,
+        ..Default::default()
+    };
+    let mut clock = BeatClock::for_config(&config);
+    for frame in 0..1_800 {
+        let time = frame as f64 * 0.02;
+        // An out-of-range hypothesis must not turn an explicitly configured
+        // triple meter into the four-beat default, even after many downbeats.
+        let meter = if time < 15. { 3 } else { 4 };
+        let result = clock.update(bar_observation(time, meter, 0.), time + 0.04, None);
+        if time >= 10. {
+            assert_bar_alignment(result, time, 3, 0.);
+        }
+    }
+}

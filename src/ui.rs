@@ -65,7 +65,6 @@ pub fn run(
         midi_loading: false,
         midi_error: None,
         settings_error: None,
-        running: true,
         error: warning,
         devices: vec![],
         now,
@@ -131,7 +130,6 @@ struct App {
     midi_loading: bool,
     midi_error: Option<String>,
     settings_error: Option<String>,
-    running: bool,
     error: Option<String>,
     devices: Vec<InputDevice>,
     now: Instant,
@@ -143,7 +141,6 @@ struct App {
 #[derive(Debug, Clone)]
 enum Message {
     Tick(Instant),
-    ToggleRun,
     Reset,
     Knob(Parameter, knob::Edit),
     EditValue(Parameter),
@@ -351,7 +348,7 @@ impl App {
             && let Err(error) = engine.start(self.config.clone())
         {
             self.error = Some(error.to_string());
-            self.running = false;
+            self.snapshot.transport = Transport::Error;
         }
     }
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -378,7 +375,7 @@ impl App {
                             } => self.input_label = format!("{input} · {rate} Hz · {channels} ch"),
                             Event::Error(error) => {
                                 self.error = Some(error);
-                                self.running = false;
+                                self.snapshot.transport = Transport::Error;
                             }
                             Event::OutputError(name) => {
                                 self.settings_error = Some(format!("Output {name} failed"))
@@ -389,7 +386,7 @@ impl App {
                         self.error = Some(
                             "The analysis worker stopped unexpectedly. Restart TempoTrack.".into(),
                         );
-                        self.running = false;
+                        self.snapshot.transport = Transport::Error;
                     }
                 }
                 for (i, pulse) in self
@@ -403,19 +400,17 @@ impl App {
                     }
                 }
             }
-            Message::ToggleRun => {
-                self.running = !self.running;
-                if self.running {
+            Message::Reset => {
+                if matches!(
+                    self.snapshot.transport,
+                    Transport::Error | Transport::Stopped
+                ) {
                     self.restart();
                 } else {
-                    self.send(Command::Stop);
-                    self.snapshot.transport = Transport::Stopped;
+                    self.cursor.reset();
+                    self.flashes = [None; 3];
+                    self.send(Command::Reset);
                 }
-            }
-            Message::Reset => {
-                self.cursor.reset();
-                self.flashes = [None; 3];
-                self.send(Command::Reset);
             }
             Message::Knob(parameter, edit) => match edit {
                 knob::Edit::Begin => self.editor = None,
@@ -554,7 +549,12 @@ impl App {
                     if let Err(error) = self.config.save() {
                         self.settings_error = Some(error.to_string());
                     }
-                    if self.running && audio_changed {
+                    if audio_changed
+                        || matches!(
+                            self.snapshot.transport,
+                            Transport::Error | Transport::Stopped
+                        )
+                    {
                         self.restart();
                     }
                     if self.settings_error.is_none() {
@@ -754,22 +754,7 @@ impl App {
         ]
         .align_y(Alignment::Center);
         let actions = row![
-            button(
-                container(
-                    text(if self.running {
-                        "Stop tracking"
-                    } else {
-                        "Start tracking"
-                    })
-                    .size(12)
-                    .font(medium_font())
-                )
-                .center_x(Fill)
-            )
-            .padding([8, 12])
-            .width(Fill)
-            .on_press(Message::ToggleRun)
-            .style(primary_button),
+            space::horizontal(),
             button(container(text("Reset").size(11)).center_x(Fill))
                 .padding([8, 12])
                 .width(70)
@@ -1244,7 +1229,6 @@ mod tests {
             midi_loading: false,
             midi_error: None,
             settings_error: None,
-            running: false,
             error: None,
             devices: vec![],
             now,
