@@ -4,9 +4,14 @@
     {
       "id": "example",
       "file": "your-track.flac",
-      "reference": "tempo_only",
+      "reference": "approximate_tap",
       "segments": [
-        { "start": 15, "end": 120, "bpm": 120 }
+        { "start": 15, "bpm": 120 }
+      ],
+      "cases": [
+        { "id": "opening", "start": 0, "duration": 90 },
+        { "id": "midpoint", "fraction": 0.5, "duration": 90 },
+        { "id": "later", "start": 180, "duration": 60, "acquire_within": 20 }
       ]
     }
   ]
