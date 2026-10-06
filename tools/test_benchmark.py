@@ -8,7 +8,7 @@ import tempfile
 from unittest.mock import patch
 from argparse import Namespace
 from html.parser import HTMLParser
-from benchmark import main, metrics, session_segments, case_specs, resolve_case, validate_cache, write_reports
+from benchmark import main, metrics, session_segments, case_specs, resolve_case, validate_cache, write_reports, probe_duration
 
 
 def row(time, bpm=120, anchor=0):
@@ -142,6 +142,16 @@ class CaseSelectionTests(unittest.TestCase):
         return Namespace(**({'cases': True, 'start': 0., 'limit': None, 'case_duration': 90.,
                              'acquire_within': 30., 'midpoints': None} | changes))
 
+    def test_source_duration_falls_back_to_container_and_rejects_invalid_values(self):
+        for stream in [{}, {'duration': None}, {'duration': 'N/A'}]:
+            with self.subTest(stream=stream):
+                self.assertEqual(probe_duration({'streams': [stream], 'format': {'duration': '100'}}), 100)
+                self.assertIsNone(probe_duration({'streams': [stream]}))
+        self.assertEqual(probe_duration({'streams': [{'duration': '90'}], 'format': {'duration': '100'}}), 90)
+        for invalid in ['nan', 'inf', '-1', '0']:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                probe_duration({'streams': [{}], 'format': {'duration': invalid}})
+
     def test_defaults_include_start_and_midpoint_without_reusing_state(self):
         specs = case_specs({}, self.args())
         self.assertEqual([spec['id'] for spec in specs], ['start', 'fraction-0_5'])
@@ -272,7 +282,7 @@ class CaseRunnerTests(unittest.TestCase):
                     kwargs['stdout'].write(json.dumps(row(0, bpm)) + '\n')
 
             argv = ['benchmark.py', str(manifest), '--out', str(output), '--cases', '--check']
-            probe = b'{"streams":[{"channels":1,"duration":"100"}]}'
+            probe = b'{"streams":[{"channels":1,"duration":"N/A"}],"format":{"duration":"100"}}'
             with patch('sys.argv', argv), patch('benchmark.subprocess.run', side_effect=run), \
                     patch('benchmark.subprocess.check_output', return_value=probe), \
                     contextlib.redirect_stdout(io.StringIO()):

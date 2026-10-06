@@ -206,6 +206,16 @@ def case_specs(track, args):
     return result
 
 
+
+def probe_duration(probe):
+    raw = probe['streams'][0].get('duration')
+    if raw in (None, 'N/A'):
+        raw = probe.get('format', {}).get('duration')
+    if raw in (None, 'N/A'):
+        return None
+    return positive(float(raw), 'source duration')
+
+
 def resolve_case(spec, source_duration):
     start = spec.get('start')
     if start is None:
@@ -357,8 +367,7 @@ def execute(args, parser):
         if not args.cached:
             probe = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=channels,duration:format=duration', '-of', 'json', str(source)]))
             channels = probe['streams'][0]['channels']
-            raw_duration = probe['streams'][0].get('duration', probe.get('format', {}).get('duration'))
-            source_duration = float(raw_duration) if raw_duration not in (None, 'N/A') else None
+            source_duration = probe_duration(probe)
             digest = hashlib.sha256()
             with source.open('rb') as file:
                 while block := file.read(1024 * 1024):

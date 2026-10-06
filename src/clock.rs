@@ -19,13 +19,21 @@ struct Fit {
     count: usize,
     spread: f64,
     latest: f64,
+    recent_beats: u32,
 }
 
 #[derive(Clone, Copy)]
 struct Candidate {
     grid: PulseGrid,
     since: f64,
-    half_time: bool,
+    kind: Change,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Change {
+    Tempo,
+    HalfTime,
+    Phase,
 }
 
 #[derive(Clone, Copy)]
@@ -47,6 +55,7 @@ pub struct BeatClock {
     output: Option<PulseGrid>,
     candidate: Option<Candidate>,
     last_good: f64,
+    acquired_at: f64,
     subdivision: u8,
     bar_offset: Option<f64>,
     meter: Option<u8>,
@@ -71,6 +80,7 @@ impl BeatClock {
             output: None,
             candidate: None,
             last_good: 0.,
+            acquired_at: 0.,
             subdivision,
             bar_offset: None,
             meter: None,
@@ -203,22 +213,16 @@ impl BeatClock {
         }
     }
     fn fit(&self, mut grid: PulseGrid, now: f64) -> Option<Fit> {
-        let mut count = 0;
-        let mut spread = 0.;
-        let mut score = 0.;
-        let mut latest = f64::NEG_INFINITY;
         for _ in 0..3 {
             let (mut weight, mut sx, mut sy, mut sxx, mut sxy) = (0., 0., 0., 0., 0.);
-            let (mut total, mut matched, mut residual) = (0., 0., 0.);
             let (mut first, mut last) = (f64::INFINITY, f64::NEG_INFINITY);
-            count = 0;
+            let mut count = 0;
             // Center the coordinates close to now for numerical stability on long sessions.
             grid.anchor += grid.position(now).round() * grid.period;
             for p in &self.points[..self.count] {
                 if p.time < now - WINDOW || p.time > now {
                     continue;
                 }
-                total += p.weight;
                 let x = grid.position(p.time).round();
                 let y = p.time - grid.anchor;
                 let error = y - x * grid.period;
@@ -231,8 +235,6 @@ impl BeatClock {
                 sy += w * y;
                 sxx += w * x * x;
                 sxy += w * x * y;
-                matched += p.weight;
-                residual += w * error * error;
                 first = first.min(p.time);
                 last = last.max(p.time);
                 count += 1;
@@ -245,23 +247,7 @@ impl BeatClock {
             if !(grid.period * 0.94..grid.period * 1.06).contains(&period) {
                 return None;
             }
-            latest = last;
             let anchor = grid.anchor + (sy - period * sx) / weight;
-            spread = (residual / weight).sqrt();
-            // Reward support on predicted beats as well as explaining observations.
-            let coverage = (matched / ((last - first) / period + 1.)).min(1.);
-            let bpm = 60. / period;
-            let outside = if bpm < 100. {
-                (100. / bpm).ln()
-            } else if bpm > 200. {
-                (bpm / 200.).ln()
-            } else {
-                0.
-            };
-            // A soft electronic-music prior, not a clamp: strong evidence may
-            // still establish a tempo outside the preferred 100–200 BPM band.
-            score = (0.7 * coverage + 0.3 * matched / total.max(1e-9))
-                / (1. + 2. * outside).min(4. / 3.);
             grid = PulseGrid {
                 anchor,
                 period,
@@ -274,12 +260,61 @@ impl BeatClock {
         {
             return None;
         }
+        // Evaluate support and timing error on the final grid, not on the
+        // pre-regression seed. Otherwise seed choice changes confidence even
+        // when two searches converge on the same beat positions.
+        let (mut total, mut matched, mut residual, mut weight) = (0., 0., 0., 0.);
+        let (mut first, mut latest) = (f64::INFINITY, f64::NEG_INFINITY);
+        let mut count = 0;
+        let mut recent = 0_u8;
+        let last = grid.position(now).floor();
+        for point in &self.points[..self.count] {
+            if point.time < now - WINDOW || point.time > now {
+                continue;
+            }
+            total += point.weight;
+            let position = grid.position(point.time);
+            let error = (position - position.round()) * grid.period;
+            if error.abs() > grid.period * 0.14 {
+                continue;
+            }
+            let w = point.weight * (0.025 / error.abs().max(0.025));
+            weight += w;
+            matched += point.weight;
+            residual += w * error * error;
+            first = first.min(point.time);
+            latest = latest.max(point.time);
+            count += 1;
+            // Distinct recent beat slots measure presence separately from
+            // salience, so louder offbeats cannot erase quieter original beats.
+            let slot = last - position.round();
+            if (0. ..6.).contains(&slot) {
+                recent |= 1 << slot as u8;
+            }
+        }
+        if count < 6 || latest - first < grid.period * 4. {
+            return None;
+        }
+        let spread = (residual / weight).sqrt();
+        let coverage = (matched / ((latest - first) / grid.period + 1.)).min(1.);
+        let bpm = 60. / grid.period;
+        let outside = if bpm < 100. {
+            (100. / bpm).ln()
+        } else if bpm > 200. {
+            (bpm / 200.).ln()
+        } else {
+            0.
+        };
+        // Soft prior, never a clamp: strong evidence can establish other tempos.
+        let score =
+            (0.7 * coverage + 0.3 * matched / total.max(1e-9)) / (1. + 2. * outside).min(4. / 3.);
         Some(Fit {
             grid,
             score,
             count,
             spread,
             latest,
+            recent_beats: recent.count_ones(),
         })
     }
     fn search(&self, seed: PulseGrid, now: f64) -> Option<Fit> {
@@ -354,6 +389,9 @@ impl BeatClock {
                 reference.is_some_and(|r| {
                     let ratio = r.period / g.period;
                     (0.72..1.38).contains(&ratio)
+                }) && raw.grids[1].is_none_or(|r| {
+                    let ratio = r.period / g.period;
+                    (ratio - 0.5).abs() > 0.03 && (ratio - 2.).abs() > 0.12
                 })
             });
             if incumbent.is_none_or(|f| f.score < 0.45)
@@ -406,7 +444,19 @@ impl BeatClock {
                 // while acquiring/recovering. It never supplies phase observations.
                 let corroborated = incumbent.is_none_or(|old| old.score < 0.45)
                     && advisory.is_some_and(|g| (g.period / f.grid.period - 1.).abs() < 0.015);
-                f.score >= if corroborated { 0.4 } else { 0.55 }
+                let precise_start = self.model.is_none()
+                    && raw.evidence.is_some()
+                    && raw.grids[1].is_some_and(|g| (g.period / f.grid.period - 1.).abs() < 0.025)
+                    && f.spread < f.grid.period * 0.035
+                    && f.recent_beats >= 3;
+                f.score
+                    >= if corroborated {
+                        0.4
+                    } else if precise_start {
+                        0.45
+                    } else {
+                        0.55
+                    }
                     && f.count >= 6
                     && f.spread < f.grid.period * 0.07
                     && now - f.latest < f.grid.period * 3.
@@ -440,15 +490,56 @@ impl BeatClock {
                 let ambiguous = harmonic
                     && incumbent.is_some_and(|old| old.score >= 0.4)
                     && !half_time_correction;
-                let better = !ambiguous && incumbent.is_none_or(|old| fit.score > old.score + 0.12);
+                let phase_replacement = self.model.is_some_and(|old| {
+                    (old.period / fit.grid.period - 1.).abs() < 0.03
+                        && phase_error(old, fit.grid, now).abs() > 0.18
+                });
+                let supported_phase = phase_replacement
+                    && incumbent.is_some_and(|old| {
+                        (old.grid.period / fit.grid.period - 1.).abs() < 0.03
+                            && phase_error(old.grid, fit.grid, now).abs() > 0.18
+                            && old.recent_beats >= 3
+                            && old.spread < old.grid.period * 0.07
+                    });
+                let better = !ambiguous
+                    && !supported_phase
+                    && incumbent.is_none_or(|old| fit.score > old.score + 0.12);
                 if self.model.is_none() {
-                    self.model = Some(fit.grid);
-                    self.last_good = now;
-                } else if better {
+                    // Low-amplitude but precise neural beats can establish a
+                    // tempo if they persist. This does not require the advisor
+                    // to agree (it may hear half-time in genuine fast music).
                     let since = self
                         .candidate
                         .filter(|old| {
-                            old.half_time == half_time_correction
+                            (old.grid.period / fit.grid.period - 1.).abs() < 0.025
+                                && phase_error(old.grid, fit.grid, now).abs() < 0.12
+                        })
+                        .map_or(now, |old| old.since);
+                    self.candidate = Some(Candidate {
+                        grid: fit.grid,
+                        since,
+                        kind: Change::Tempo,
+                    });
+                    let corroborated =
+                        advisory.is_some_and(|g| (g.period / fit.grid.period - 1.).abs() < 0.015);
+                    if fit.score >= 0.55 || corroborated || now - since >= 2. {
+                        self.model = Some(fit.grid);
+                        self.last_good = now;
+                        self.acquired_at = now;
+                        self.candidate = None;
+                    }
+                } else if better {
+                    let kind = if half_time_correction {
+                        Change::HalfTime
+                    } else if phase_replacement {
+                        Change::Phase
+                    } else {
+                        Change::Tempo
+                    };
+                    let since = self
+                        .candidate
+                        .filter(|old| {
+                            old.kind == kind
                                 && (old.grid.period / fit.grid.period - 1.).abs() < 0.025
                                 && phase_error(old.grid, fit.grid, now).abs() < 0.12
                         })
@@ -456,9 +547,27 @@ impl BeatClock {
                     self.candidate = Some(Candidate {
                         grid: fit.grid,
                         since,
-                        half_time: half_time_correction,
+                        kind,
                     });
-                    let confirmation = if half_time_correction { 6. } else { 2. };
+                    // An offbeat-only passage need not change musical phase.
+                    // Give the established phase sixteen beats to reappear;
+                    // actual tempo changes retain the faster recovery path.
+                    let confirmation = match kind {
+                        // Before one full observation window, a cold-start lock
+                        // is provisional. Strong neural evidence plus independent
+                        // tempo agreement can correct its octave sooner. Mature
+                        // locks retain the longer confirmation requirement.
+                        Change::HalfTime
+                            if since - self.acquired_at < WINDOW
+                                && corroborated_half
+                                && fit.score >= 0.8 =>
+                        {
+                            2.
+                        }
+                        Change::HalfTime => 6.,
+                        Change::Phase => fit.grid.period * 16.,
+                        Change::Tempo => 2.,
+                    };
                     if now - since >= confirmation {
                         self.model = Some(fit.grid);
                         self.last_good = now;
@@ -535,4 +644,41 @@ impl BeatClock {
 }
 fn phase_error(old: PulseGrid, target: PulseGrid, now: f64) -> f64 {
     (target.position(now) - old.position(now) + 0.5).rem_euclid(1.) - 0.5
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn residual_is_measured_against_the_returned_grid() {
+        let mut clock = BeatClock::new(4);
+        for beat in 0..24 {
+            let jitter = [0.055, -0.03, 0.012, -0.055, 0.025][beat % 5];
+            clock.push(beat as f64 * 0.5 + jitter, 0.9);
+        }
+        for period in [0.499, 0.5, 0.501] {
+            let fit = clock
+                .fit(
+                    PulseGrid {
+                        anchor: 0.03,
+                        period,
+                        provenance: Provenance::Detected,
+                    },
+                    12.,
+                )
+                .expect("enough coherent beats for a fit");
+            let (mut weight, mut residual) = (0., 0.);
+            for point in &clock.points[..clock.count] {
+                let position = fit.grid.position(point.time);
+                let error = (position - position.round()) * fit.grid.period;
+                if error.abs() <= fit.grid.period * 0.14 {
+                    let w = point.weight * 0.025 / error.abs().max(0.025);
+                    weight += w;
+                    residual += w * error * error;
+                }
+            }
+            assert!((fit.spread - (residual / weight).sqrt()).abs() < 1e-12);
+        }
+    }
 }
