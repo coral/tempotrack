@@ -71,6 +71,10 @@ pub struct Messenger {
     pub interface: Option<Arc<UdpSocket>>,
     /// Discovery replies need a unique port, not the multicast port shared by peers.
     unicast_interface: Arc<UdpSocket>,
+    // A stable source interface per socket is essential on macOS. Switching a
+    // wildcard socket between LAN and loopback can leave sends returning
+    // WouldBlock permanently, including ordinary unicast discovery replies.
+    loopback_interface: Arc<UdpSocket>,
     pub peer_state: Arc<Mutex<PeerState>>,
     pub ttl: u8,
     pub ttl_ratio: u8,
@@ -99,9 +103,14 @@ impl Messenger {
             warn!("Link loopback multicast membership: {error}");
         }
 
+        let loopback = new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        socket2::SockRef::from(&loopback)
+            .set_multicast_if_v4(&Ipv4Addr::LOCALHOST)
+            .unwrap();
         Messenger {
             interface: Some(Arc::new(socket)),
             unicast_interface: Arc::new(new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into()).unwrap()),
+            loopback_interface: Arc::new(loopback),
             peer_state,
             ttl: 2, // Reduced from 5 to 2 seconds for faster peer timeout detection
             ttl_ratio: 20,
@@ -115,6 +124,7 @@ impl Messenger {
     pub async fn listen(&self) {
         let socket = self.interface.as_ref().unwrap().clone();
         let unicast = self.unicast_interface.clone();
+        let loopback = self.loopback_interface.clone();
         let peer_state = self.peer_state.clone();
         let ttl = self.ttl;
         let tx_event = self.tx_event.clone();
@@ -127,9 +137,11 @@ impl Messenger {
             loop {
                 let mut buf = [0; MAX_MESSAGE_SIZE];
                 let mut unicast_buf = [0; MAX_MESSAGE_SIZE];
+                let mut loopback_buf = [0; MAX_MESSAGE_SIZE];
                 let (result, buf) = select! {
                     result = socket.recv_from(&mut buf) => (result, &buf),
                     result = unicast.recv_from(&mut unicast_buf) => (result, &unicast_buf),
+                    result = loopback.recv_from(&mut loopback_buf) => (result, &loopback_buf),
                 };
                 let (amt, src) = result.unwrap();
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
@@ -174,7 +186,11 @@ impl Messenger {
                             }
 
                             send_response(
-                                unicast.clone(),
+                                if src.ip().is_loopback() {
+                                    loopback.clone()
+                                } else {
+                                    unicast.clone()
+                                },
                                 peer_state.clone(),
                                 ttl,
                                 src,
@@ -212,6 +228,7 @@ impl Messenger {
             self.ttl_ratio,
             self.last_broadcast_time.clone(),
             self.unicast_interface.clone(),
+            self.loopback_interface.clone(),
             self.peer_state.clone(),
             SocketAddrV4::new(MULTICAST_ADDR, LINK_PORT),
             self.notifier.clone(),
@@ -226,6 +243,7 @@ pub async fn broadcast_state(
     ttl_ratio: u8,
     last_broadcast_time: Arc<Mutex<Instant>>,
     socket: Arc<UdpSocket>,
+    loopback: Arc<UdpSocket>,
     peer_state: Arc<Mutex<PeerState>>,
     to: SocketAddrV4,
     n: Arc<Notify>,
@@ -283,7 +301,8 @@ pub async fn broadcast_state(
                     };
 
                     if should_broadcast {
-                        send_peer_state(s.clone(), peer_state.clone(), ttl, ALIVE, to, lbt).await;
+                        send_peer_state(s.clone(), peer_state.clone(), ttl, ALIVE, to, lbt.clone()).await;
+                        send_peer_state(loopback.clone(), peer_state.clone(), ttl, ALIVE, to, lbt).await;
                     }
                 }
             }
@@ -318,21 +337,13 @@ pub async fn send_message(
 
     let message = encode_message(from, ttl, message_type, payload).unwrap();
 
-    let _sent_bytes = socket.send_to(&message, to).await.unwrap();
-    if to.ip().is_multicast() {
-        // Keep the original discovery source port so replies reach our listener.
-        // No await between changing and restoring the outgoing interface: other
-        // tasks on the output's current-thread runtime cannot see the temporary
-        // setting. A full socket drops this announcement; the next one retries.
-        let options = socket2::SockRef::from(socket.as_ref());
-        if let Ok(previous) = options.multicast_if_v4() {
-            if options.set_multicast_if_v4(&Ipv4Addr::LOCALHOST).is_ok() {
-                if let Err(error) = socket.try_send_to(&message, to.into()) {
-                    debug!("Link loopback announcement: {error}");
-                }
-                let _ = options.set_multicast_if_v4(&previous);
-            }
-        }
+    // Discovery is periodic, best-effort UDP. Never suspend the receive loop
+    // waiting to send a reply: that would also stop refreshing peer lifetimes.
+    // Use the already nonblocking descriptor directly; a later announcement
+    // retries even if the OS does not generate another writable readiness edge.
+    let options = socket2::SockRef::from(socket.as_ref());
+    if let Err(error) = options.send_to(&message, &SocketAddr::V4(to).into()) {
+        debug!("Link discovery send to {to}: {error}");
     }
 }
 

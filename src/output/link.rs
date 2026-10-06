@@ -447,6 +447,12 @@ mod tests {
             }
         });
         let mut output = LinkOutput::open().unwrap();
+        // GUI startup opens destinations before the detector has an audio clock.
+        let idle_until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < idle_until {
+            output.poll(Instant::now()).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
         let start = Instant::now();
         let wall_start = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -456,6 +462,7 @@ mod tests {
         let changed_period = 60. / 137.3;
         let mut samples = Vec::new();
         let mut peer_counts = Vec::new();
+        let mut reset_during_dropout = false;
         while start.elapsed() < Duration::from_secs(12) {
             let now = Instant::now();
             let elapsed = start.elapsed().as_secs_f64();
@@ -466,6 +473,17 @@ mod tests {
             };
             let mut snapshot = RhythmSnapshot::empty(start, Tracking::Assisted);
             snapshot.transport = Transport::Tracking;
+            // Losing the audio clock and resetting the tracker must not tear
+            // down the peer session. Link freewheels until audio resumes.
+            // Longer than the discovery peer timeout, so retained membership
+            // proves networking is still running throughout the dropout.
+            if (4.0..8.0).contains(&elapsed) {
+                snapshot.transport = Transport::Listening;
+                if !reset_during_dropout {
+                    output.reset();
+                    reset_during_dropout = true;
+                }
+            }
             snapshot.valid_until = now + Duration::from_millis(250);
             snapshot.meter = Some(4);
             snapshot.grids[1] = Some(PulseGrid {

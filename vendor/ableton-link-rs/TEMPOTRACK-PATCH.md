@@ -9,15 +9,20 @@ This library-only package omits that demo dependency, example targets, and dev-o
 console-subscriber. It preserves the upstream version and runtime dependencies;
 no application dependency is downgraded. Upstream LICENSE is retained.
 
-The active IPv4 messenger now joins the loopback multicast group and mirrors
-multicast announcements and goodbye messages to loopback. Official Ableton Link
+The active IPv4 messenger now joins the loopback multicast group and sends
+multicast announcements and goodbye messages on loopback. Official Ableton Link
 uses a separate loopback discovery interface for applications on the same host;
 joining only the default physical interface prevented local interoperability.
 Normal outbound announcements still use the default network interface. This
 patch does not claim dynamic multi-interface or IPv6 support.
 
-Discovery sends from a separate ephemeral UDP socket and listens for replies on
-that socket as well as the shared multicast port. This matches the official
+Discovery uses separate ephemeral UDP sockets for the default network route and
+loopback, and listens for replies on both as well as the shared multicast port.
+The loopback socket stays bound to localhost with a fixed multicast interface.
+Switching a single wildcard socket between network and loopback routes reproduced
+persistent macOS EWOULDBLOCK errors after a few seconds. Nonblocking, best-effort
+sends also prevent a blocked reply from suspending the discovery receive loop
+and expiring all peers. This matches the official
 implementation and avoids relying on which process receives unicast replies to
 the shared port 20808. Clock measurement binds an unspecified source address
 before connecting, allowing the kernel to select a route to loopback or a
@@ -29,12 +34,12 @@ subscriber corrupted machine-readable output such as the timing probe's JSON.
 The discovery gateway also no longer installs a process-global Ctrl-C handler;
 TempoTrack owns process termination, explicit disable, and runtime teardown.
 
-An opt-in test checks sustained peer membership, a live tempo change, phase,
-and absence of transport control against an official C++ Ableton Link peer using
-tools/link_reference.cpp. Constant-tempo reception alone is insufficient because
-a disconnected peer can keep freewheeling. Sustained interoperability remains
-unverified in the development environment: a reference-only C++ control also
-retained its initial tempo, and local firewall permissions are being checked.
+An opt-in test checks delayed audio startup, sustained peer membership, audio
+clock loss and tracker reset, a live tempo change, phase, and absence of transport
+control against an official C++ Ableton Link peer using tools/link_reference.cpp.
+Constant-tempo reception alone is insufficient because a disconnected peer can
+keep freewheeling. The separate-socket fix passed the macOS reference test with
+Ableton Live also present; phase error is checked against a 20 ms limit.
 The application adapter aligns the audio clock once when the first peer session
 is joined, then bounds subsequent phase changes to 2 ms.
 
